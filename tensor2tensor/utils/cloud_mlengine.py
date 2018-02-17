@@ -17,35 +17,24 @@
 
 import datetime
 import os
-import shutil
+import subprocess
 import sys
-import tempfile
 
 from googleapiclient import discovery
 from oauth2client.client import GoogleCredentials
 from tensor2tensor.layers import common_hparams
 from tensor2tensor.utils import cloud_tpu as cloud
 from tensor2tensor.utils import registry
-from tensor2tensor.utils import usr_dir as usr_dir_lib
 import tensorflow as tf
 
 FLAGS = tf.flags.FLAGS
+PACKAGE_NAME = 'trainer'
+VERSION = 0.1
 
 CONSOLE_URL = 'https://console.cloud.google.com/mlengine/jobs/'
 
 # TODO(rsepassi):
 # * Enable multi-machine sync/async training
-
-SETUP_PY = """
-from setuptools import find_packages
-from setuptools import setup
-setup(
-    name='DummyUsrDirPackage',
-    version='0.1',
-    packages=find_packages(),
-)
-"""
-
 
 def job_dir():
   # The flag --job-dir is parsed differently before and after switching to absl
@@ -73,6 +62,12 @@ def flags_as_args():
       continue
     args.extend(['--%s' % name, str(val)])
   return args
+
+
+def _get_additional_packages():
+  if FLAGS.packages:
+    return FLAGS.packages.split(',')
+  return []
 
 
 def machine_config(num_gpus=1, use_tpu=False, master_type=None):
@@ -133,6 +128,8 @@ def configure_job():
 
   if training_input['scaleTier'] == 'CUSTOM':
     assert 'masterType' in training_input
+  else:
+    assert 'masterType' not in training_input
 
   timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
   job_name = '%s_%s_t2t_%s' % (FLAGS.model, FLAGS.problems, timestamp)
@@ -147,57 +144,6 @@ def launch_job(job_spec):
   cloudml = discovery.build('ml', 'v1', credentials=credentials)
   request = cloudml.projects().jobs().create(body=job_spec, parent=project_id)
   request.execute()
-
-
-def _tar_and_copy(src_dir, target_dir):
-  """Tar and gzip src_dir and copy to GCS target_dir."""
-  src_dir = src_dir.rstrip('/')
-  target_dir = target_dir.rstrip('/')
-  tmp_dir = tempfile.gettempdir().rstrip('/')
-  src_base = os.path.basename(src_dir)
-  cloud.shell_run(
-      'tar -zcf {tmp_dir}/{src_base}.tar.gz -C {src_dir} .',
-      src_dir=src_dir,
-      src_base=src_base,
-      tmp_dir=tmp_dir)
-  final_destination = '%s/%s.tar.gz' % (target_dir, src_base)
-  cloud.shell_run(
-      ('gsutil cp {tmp_dir}/{src_base}.tar.gz '
-       '{final_destination}'),
-      tmp_dir=tmp_dir,
-      src_base=src_base,
-      final_destination=final_destination)
-  return final_destination
-
-
-def tar_and_copy_t2t(train_dir):
-  """Tar Tensor2Tensor and cp to train_dir."""
-  tf.logging.info('Tarring and pushing local Tensor2Tensor package.')
-  t2t_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-  t2t_tar = _tar_and_copy(t2t_dir, train_dir)
-  return t2t_tar
-
-
-def tar_and_copy_usr_dir(usr_dir, train_dir):
-  """Package, tar, and copy usr_dir to GCS train_dir."""
-  tf.logging.info('Tarring and pushing t2t_usr_dir.')
-  usr_dir = os.path.abspath(os.path.expanduser(usr_dir))
-  # Copy usr dir to a temp location
-  top_dir = os.path.join(tempfile.gettempdir(), 't2t_usr_container')
-  tmp_usr_dir = os.path.join(top_dir, usr_dir_lib.INTERNAL_USR_DIR_PACKAGE)
-  shutil.rmtree(top_dir, ignore_errors=True)
-  shutil.copytree(usr_dir, tmp_usr_dir)
-  # Insert setup.py if one does not exist
-  top_setup_fname = os.path.join(top_dir, 'setup.py')
-  usr_setup_fname = os.path.join(tmp_usr_dir, 'setup.py')
-  if tf.gfile.Exists(usr_setup_fname):
-    tf.gfile.Copy(usr_setup_fname, top_setup_fname)
-    tf.gfile.Remove(usr_setup_fname)
-  else:
-    with tf.gfile.Open(top_setup_fname, 'w') as f:
-      f.write(SETUP_PY)
-  usr_tar = _tar_and_copy(top_dir, train_dir)
-  return usr_tar
 
 
 def autotune_paramspecs(hparams_range):
@@ -223,13 +169,60 @@ def configure_autotune(hparams_range,
 def configure_trainer_package(job_spec, t2t_tar):
   assert t2t_tar.startswith('gs://')
   job_spec['trainingInput']['packageUris'] = [t2t_tar]
+  if FLAGS.t2t_usr_dir:
+    usr_args = ['--t2t_usr_dir', os.path.basename(FLAGS.t2t_usr_dir)]
+    job_spec['trainingInput']['args'].extend(usr_args)
 
 
-def configure_usr_dir(job_spec, usr_tar):
-  assert usr_tar.startswith('gs://')
-  job_spec['trainingInput']['packageUris'].append(usr_tar)
-  usr_args = ['--t2t_usr_dir', usr_dir_lib.INTERNAL_USR_DIR_PACKAGE]
-  job_spec['trainingInput']['args'].extend(usr_args)
+def build_t2t_python_package():
+  """Writes setup.py file and builds trainer package."""
+  if FLAGS.t2t_usr_dir:
+    top_dir = os.path.dirname(os.path.abspath(FLAGS.t2t_usr_dir))
+  else:
+    top_dir = '.'
+  setup_file_path = os.path.join(top_dir, 'setup.py')
+  # TODO(bgb): Allow the user to pin tensor2tensor to a specific version.
+  packages = ['tensor2tensor']
+  packages.extend(_get_additional_packages())
+  # TODO(bgb): Add where clause to find_packages() to only include usr_dir.
+  setup_py = """
+from setuptools import find_packages
+from setuptools import setup
+setup(
+    name='{package_name}',
+    version='{version}',
+    packages=find_packages(),
+    install_requires={pypi_packages},
+    include_package_data=True
+)
+""".format(
+    package_name=PACKAGE_NAME,
+    version=VERSION,
+    pypi_packages=str(packages))
+  with tf.gfile.Open(setup_file_path, 'w') as f:
+    f.write(setup_py)
+  command = ['python', setup_file_path, 'sdist']
+  popen = subprocess.Popen(command, subprocess.PIPE, cwd=top_dir)
+  popen.wait()
+
+
+def upload_trainer_package_to_gcs(train_dir):
+  """Upload trainer package to GCS.
+
+  Args:
+    train_dir: The GCS directory in which to stage the trainer package.
+  Returns:
+    The path to the trainer package staged in GCS."""
+  tf.logging.info('Uploading trainer package to %s.', train_dir)
+  src_base = '{}-{}.tar.gz'.format(PACKAGE_NAME, VERSION)
+  package_path = os.path.join(os.getcwd(), 'dist', src_base)
+  final_destination = os.path.join(train_dir, src_base)
+  cloud.shell_run(
+      ('gsutil cp {package_path} '
+       '{final_destination}'),
+      package_path=package_path,
+      final_destination=final_destination)
+  return final_destination
 
 
 def launch():
@@ -241,17 +234,15 @@ def launch():
   assert FLAGS.worker_replicas <= 1
   assert FLAGS.ps_replicas <= 0
 
+  build_t2t_python_package()
   job_spec = configure_job()
   job_name = job_spec['jobId']
   tf.logging.info('Launching job %s with ML Engine spec:\n%s', job_name,
                   job_spec)
   assert cloud.confirm()
   train_dir = FLAGS.output_dir
-  t2t_tar = tar_and_copy_t2t(train_dir)
-  configure_trainer_package(job_spec, t2t_tar)
-  if FLAGS.t2t_usr_dir:
-    usr_tar = tar_and_copy_usr_dir(FLAGS.t2t_usr_dir, train_dir)
-    configure_usr_dir(job_spec, usr_tar)
+  trainer_package_gcs_path = upload_trainer_package_to_gcs(train_dir)
+  configure_trainer_package(job_spec, trainer_package_gcs_path)
   launch_job(job_spec)
   tf.logging.info('Launched %s. See console to track: %s.', job_name,
                   CONSOLE_URL)

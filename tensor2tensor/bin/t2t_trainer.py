@@ -93,6 +93,11 @@ flags.DEFINE_string("cloud_mlengine_master_type", None,
                     "GPUs on machine type. See documentation: "
                     "https://cloud.google.com/ml-engine/reference/rest/v1/"
                     "projects.jobs#traininginput")
+flags.DEFINE_string("packages", None,
+                    "Additional PyPi packages to install into the CloudML "
+                    "runtime. Default packages are available here: "
+                    "https://cloud.google.com/ml-engine/docs/"
+                    "runtime-version-list")
 # Hyperparameter tuning on Cloud ML Engine
 # Pass an --hparams_range to enable
 flags.DEFINE_string("autotune_objective", None,
